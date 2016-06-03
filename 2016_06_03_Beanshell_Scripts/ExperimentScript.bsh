@@ -1,0 +1,588 @@
+/*
+SUMMARY:
+This script is intended to control a microscope and to control a microcontroller running the chemostatController.ino file. It tells the microcontroller
+what ratio of time peristaltic pumps should be on, and when the sampling pump should be off. It controls the microscope to acquire images of the yeast. It then
+uses FIJI's software to analyze those images.
+
+INPUT:
+1) This program assumes that the positions to images are listed in micromanager's "stage position list."
+
+OUTPUT:
+1) Many images
+2) A summary.csv file summarizing the experiment
+3) A microcontrollerRecords.csv file, containing messages received from the microcontroller
+4) A translations.csv file. IT is useful to know the translations that were applied images in order to align them.
+REQUIRES:
+1) FIJI (or imageJ)
+2) Micromanager
+3) The users to review the values of the initially declared variables below. The values of certain parameters are hard-coded into the script for each time that this is run.
+    
+    
+    Written by Cameron Stewart
+						Research intern at UW-Madison
+               cameronstewart92@gmail.com
+    Last revised on February 29, 2016
+ */
+
+
+
+import mmcorej.CharVector; 
+import org.micromanager.api.AcquisitionOptions;
+import org.micromanager.api.PositionList;
+import org.micromanager.api.MultiStagePosition;
+import org.micromanager.api.StagePosition;
+
+
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.lang.System;
+
+import org.apache.commons.math.stat.StatUtils;
+import org.apache.commons.math.stat.descriptive.DescriptiveStatistics;
+
+import ij.IJ;
+import ij.ImagePlus;
+import ij.io.Opener;
+import ij.measure.Measurements;
+import ij.measure.ResultsTable;
+import ij.plugin.filter.BackgroundSubtracter;
+import ij.plugin.filter.ParticleAnalyzer;
+import ij.process.ImageProcessor;
+import ij.ImagePlus;
+import ij.io.FileSaver;
+import ij.WindowManager;  
+import ij.text.TextWindow; 
+import ij.plugin.Duplicator;
+import ij.text.TextPanel;
+import ij.plugin.frame.RoiManager;
+import ij.plugin.ImageCalculator;
+
+print("hello");
+boolean retroAnalysis=false; //Set to true if you would like to reanalyze images that were taken during a previous experiment, and then see where this is checked
+
+//****************************************************************************************************
+// *******************Experiment specific variable - Frequently modified******************************
+//****************************************************************************************************
+
+//	BACKGROUND- These variables configure if and how background images will be taken. If background images are taken, 
+//then a background images will be formed from the mean pixel at the pixel location of all of the images taken. This
+//image will then be subtracted from images taken during the experiment.
+float mediaRatioOn=0.343; //This indicates the ratio of time that the media pump will be ON during each 30 second interval
+float sampleRatioOn=0.5; //This indicates the ratio of time that the media pump will be ON during each 30 second interval
+//FILE DIRECTORY AND NAMES
+String rootDir="C:\\Users\\NIKON\\Pictures\\2016-01-04-ChemostatRun\\"; //directory where everything from this experiment. //The path should 
+//			contain "\\" where there is normally "\" ("\" is the Java escape character), and it should end with "\\" (for Windows)
+
+String arduinoPort = "COM4"; //This is the USB port that the relay board is attached to. On Windows this can be found via Control Panel>Device Manager>Ports
+// TIMING
+long durationMillis=7*24*60*60*1000;// Set this variable to the number of milliseconds that an experiment should run. For example, if the experiment should run for 1 day
+// then assign it the value of 1*24*60*60*1000.
+
+// This 2D array will be sent to the Arduino, and the Arduino will use it to know when and how to turn on the LED matrix.
+//THe first term is the time at which the instruction should be followed, the second is the number of LEDs that should be turned ON (in the range of 0-64),
+//and the third is the PWM of the LEDs (in the range of 0-15). For example, if the array was:
+// {{0,0,0},
+//  {5000,64,8}
+// };   Then no lights would be on for the first 5 seconds. Then, 64 LEDs would be on at (very roughly) 8 fifteenths of their full intensity until the ardsuino received new intructions.
+//When a timecourse is sent, it overrides previous timecourses.
+long [][] timeCourse = new long [][]{
+	{0,0,0},
+	{6*60*60,1,8},
+	{12*60*60,0,0},
+	{18*60*60,8,8},
+	{24*60*60,0,0},
+	{30*60*60,16,8},
+	{36*60*60,0,0},
+	{42*60*60,24,8},
+	{48*60*60,0,0},
+	{54*60*60,32,8}
+};
+
+
+//****************************************************************************************************
+// *******************Experiment specific variable - Occasionally modified******************************
+//****************************************************************************************************
+
+boolean needBgSamples=true;// If true- Background images will be taken before experiment runs. If false- They will not and other BG variables can be ignored
+int bgSamples=3; //Number of background images to take per image location. Odd number >1 recommended because the median intensity at each pixel location is used.
+
+int arduinoInterval=30000; // This is important. The interval between sets of background images being taken should be greater than (1-sampleRatioOn)*arduinoInterval.
+// This must be known so that media will definetly have moved at least a bit between acquisitions
+//****************************************************************************************************
+//**************Configuration specific variables******************************
+//****************************************************************************************************
+//MICROMANAGER CONFIGURATION
+String configGroup="Filters"; //Micromanager configuration group
+String[] configPresets={"1-DIC","5-YFP"}; // Micromanager presets. Cells will be located from the first channel listed, and their fluorescence will be measured from the second
+//WARNING!! alignImages assumes that roiPresets sorts before analyzePreset alphabetically! Edit the method if this is not true.
+String darkPreset="Dark";//Set this to the preset that will be used between images. Ideally a dark one
+
+
+
+//****************************************************************************************************
+// **************Rarely modified variables************************************************************
+//******************************************************************************************************
+boolean liveMode=false; //Set to true to show video between single-image aquisitions. Set to false to save computer resources.
+
+//MICROSCOPE STAGE
+int intervals=5; //If the position list has only 2 positions, it replace them with "intervals" positions, each along the x,y,z axis formed by the two positions
+int roiPreset=0; //The program will analyze this preset to find regions of interest
+int analyzePreset=1; //The program will apply the ROIs to this and make measurements on this
+String[] configPresetsBG={"Difference", "Subtract"}; //How should the background influence the image. Difference gives absolute difference. Subtract sets negative pixels to 0.
+//OPERATING SYSTEM (see file names too, as they depend on OS)
+String lineSeparator="\r\n";// End the string with \r\n for Windows and \n for Unix. System.lineSeparator() should theoretically return
+// 								the correct line separator, but it didn't work for me, even though I explicitly imported java.lang.System;
+//File details within the directory specified above
+String dataFile="Summary";//Name of .csv file containing summary information of the experiment. Name will be concatenated with the date and time
+String translationFile="Translations";
+String tempFile="microcontrollerRecords";
+String[] imageType={"Tiff",".tiff"}; //imageType[0] refers to how imageJ saves it, imageType[1] refers to its actual file name
+
+String commandTerminator = "e"; //for arduino
+
+int imageNumber=0; //images taken so far
+boolean samplePumpIsOn; //Used later to keep track of whether or not the pump is on
+boolean lightIsOn=false;
+boolean mediaPumpIsOn=false;
+int ROIs;
+double curIntensity;
+long imageTime;
+String title;
+FileWriter fileW;
+PrintWriter output;
+xyStage = mmc.getXYStageDevice();
+zStage = mmc.getFocusDevice();
+PositionList pl = gui.getPositionList();
+SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-z");
+String startTime;
+//**************************************************************************************************************************
+//****************METHODS USED IN MAIN EXPERIMENT BELOW*********************************************************************
+//**************************************************************************************************************************
+
+public alignImages(String title1, String title2){
+	imp = IJ.openImage(title1);
+	imp.show();
+	imp2 = IJ.openImage(title2);
+	imp2.show();
+	IJ.run(imp, "Images to Stack", "name=Stack title=[] use");
+	imp = IJ.getImage();
+	//IJ.setTool("rectangle");
+	IJ.run(imp, "Align slices in stack...", "method=5 windowsizex=2487 windowsizey=2067 x0=36 y0=48 swindow=0 subpixel=false itpmethod=0 ref.slice=1 show=true");
+	TextWindow tw = (TextWindow)WindowManager.getFrame("Results"); 
+	TextPanel tp=tw.getTextPanel();
+	ResultsTable st = tp.getResultsTable(); 
+	
+	 int n=st.getCounter(); //Assumes that summaries (Mean, SD, Max, Min...) have NOT been added after the last result
+	 int dX=(int) st.getValue("dX",0);
+	 int dY=(int) st.getValue("dY",0);
+	 IJ.run("Close All", "");//close all windows
+	 imp2 = IJ.openImage(title2);
+	imp2.show();
+	//IJ.run(imp, "Translate...", "x=-37.5 y=-45 interpolation=None")
+	String offset="x="+dX+" y="+dY+" interpolation=None";
+	//The stack is ordered alphabetically.
+	if(title1.compareTo(title2)<0){
+		IJ.run(imp2, "Translate...",offset);
+		IJ.saveAs(imp2,imageType[0], title2);
+		FileWriter writer = new FileWriter(rootDir+translationFile+startTime+".csv",true); 
+		writer.write(title2+", "+dX+", "+dY+lineSeparator);
+		writer.close();
+}else if(title1.compareTo(title2)>0){
+		IJ.run(imp1, "Translate...",offset);
+		IJ.saveAs(imp1,imageType[0], title1);
+		FileWriter writer = new FileWriter(rootDir+translationFile+startTime+".csv",true); 
+		writer.write(title1+", "+dX+", "+dY+lineSeparator);
+		writer.close();
+	}else
+		print("WARNING. Titles cannot be identical");
+}
+
+public int processAndThreshold(String title, String saveAs){//CJS
+
+	//This workflow is based on http://fiji.sc/Segmentation
+	IJ.run("Close All", "");
+	ImagePlus imp=IJ.openImage(title);
+	//This code can be easily replaced by code recorded while manually
+	//manipulating an image Plugins > Macros> Record... > Record BeanShell
+	//This script assumes that rm will be updated (probably by using the Particle Analyzer)
+	Thread.sleep(200);//give time for image to open
+	imp.show();
+	IJ.run(imp, "Smooth", ""); //Smooth and then find edges tends to reduce the noise more than the signal
+	IJ.run(imp, "Subtract Background...", "rolling=30");
+	IJ.run(imp, "Find Edges", "");
+	//IJ.run(imp, "Subtract Background...", "rolling=5"); //too slow. not very helpful
+//	IJ.setAutoThreshold(imp, "IsoData dark"); //THresholds tends to be too low. Includes too much junk
+	IJ.setAutoThreshold(imp, "Moments dark");
+	Prefs.blackBackground = true;
+	IJ.run(imp, "Convert to Mask", "");
+
+//remove outliers 20 pixels
+//close twice
+	IJ.run(imp, "Remove Outliers...", "radius=10 threshold=50 which=Bright");
+	IJ.run(imp, "Options...", "iterations=5 count=1 black do=Nothing");
+	IJ.run(imp, "Dilate", "");
+	IJ.run(imp, "Options...", "iterations=2 count=1 black do=Nothing");
+	IJ.run(imp, "Close-", "");
+	IJ.run(imp, "Fill Holes", "");
+	IJ.run(imp, "Options...", "iterations=5 count=1 black do=Nothing");
+	IJ.run(imp, "Erode", "");
+	IJ.run(imp, "Remove Outliers...", "radius=20 threshold=50 which=Bright");
+
+	rm = RoiManager.getInstance();
+	if (rm==null) rm = new RoiManager();
+	if(rm.getCount()!=0){//Clear ROI manager
+		rm.runCommand("Deselect");
+		rm.runCommand("Delete");
+	}
+	rm.runCommand("Show All with labels");
+	rm.runCommand("Show All");
+	//This is configured for the 40X objective
+	IJ.run(imp, "Analyze Particles...", "size=2000-15000 circularity=0.50-1.00 exclude include add");//changed from 1215
+		//"Analyze Particles..." automatically updates rm
+	Thread.sleep(100);
+	IJ.saveAs(imp,imageType[0], saveAs);
+	Thread.sleep(500);//time for images to save
+		//If nothing was mesured, it is non-diagnostic. Update expHistory accordingly
+		return rm.getCount();
+}
+
+public void analyzeROIs(String title){//This fills the results table
+	rm = RoiManager.getInstance();
+	imp=IJ.openImage(title);
+	imp.show();//Showing the image is important because it selects the image. Some of these commands run on the selected image
+	IJ.run(imp,"From ROI Manager", ""); //get ROIs from rm and set as Overlay on imp2
+	IJ.run("Set Measurements...", "area mean standard min median redirect=None decimal=3");
+	rm.runCommand("Measure"); //get new results
+	IJ.saveAs(imp, imageType[0],title);
+}
+public void backgroundArithmetic(String bg, String image, String saveAs, String method){
+	imp1=IJ.openImage(image);
+	imp1.show();
+	Thread.sleep(50);
+	imp2=IJ.openImage(bg); //Background image created by generateBG()
+	imp2.show();
+	Thread.sleep(50);//Give time for images to open
+	ImageCalculator ic = new ImageCalculator();
+	ImagePlus imp3 = ic.run(method+" create", imp1, imp2);
+	Thread.sleep(50);
+	imp3.show();
+	IJ.saveAs(imageType[0], saveAs);
+	Thread.sleep(50);//give time for image to save
+}	
+//This generates the background by taking several images and using the median pixel from each.
+public void generateBG(){
+	print("The current time is "+sdf.format(new Date()));
+	print("The microscope will now acquire "+bgSamples+" at each of the "+pl.getNumberOfPositions()+" positions specified.");
+	print("The median pixel of the images at each position will be used to create a background image for each position.");
+	print("The background image will then be subtracted from later acquired images so that the difference between the image and the background is emphasized.");
+	for(int q=0;q<bgSamples;q++){
+		mmc.setConfig(configGroup,darkPreset);
+		while(System.currentTimeMillis()<(lastBG+((1-sampleRatioOn)*arduinoInterval))){
+			// While not enough time has passed to ensure that the media has moved since the last set of images were taken
+			Thread.sleep(1000);
+		}
+				//Take images
+			for (int l=0; l < pl.getNumberOfPositions(); l++) {
+				MultiStagePosition.goToPosition(pl.getPosition(l), mmc);
+				for (int i=0;i<configPresets.length;i++){
+					mmc.setConfig(configGroup,configPresets[i]);
+					mmc.waitForSystem();
+					Thread.sleep(20); //let vibrations dissipate
+					gui.snapSingleImage();
+					Thread.sleep(20);//Make sure things are synchronized
+					mmc.setConfig(configGroup,darkPreset);
+					//Save Image1 as it is. This also delays when the next images is taken, 
+					//which prevents micromanager and imageJ from acting out of sync	
+					Thread.sleep(300); //500 millisecond delay. ImageJ cannot get the image (and therefore cannot save it) until the image loaded
+					IJ.saveAs(imageType[0], rootDir+"BG_"+configPresets[i]+"_Position_"+l+"_Sample_"+q+imageType[1]);
+					Thread.sleep(100);//Give time for images to save
+				}
+		}//end for loop
+		//Turn off pinch valve (open). Turn on room lights
+	}
+	//Make image from the median pixel of each
+	for (int l=0; l < pl.getNumberOfPositions(); l++) {
+		for(int i=0;i<configPresets.length;i++){
+		IJ.run("Close All", "");//close all windows
+		for(int q=0;q<bgSamples;q++){
+			imp=IJ.openImage(rootDir+"BG_"+configPresets[i]+"_Position_"+l+"_Sample_"+q+imageType[1]);
+			Thread.sleep(50); //50 millisecond delay. ImageJ cannot get the image until the image loaded
+			imp.show();
+			Thread.sleep(50); //50 millisecond delay. ImageJ cannot get the image until the image loaded
+			}
+		IJ.run("Images to Stack", "name=Stack title=[] use");
+	   Thread.sleep((20*bgSamples)+200); //give time to make stack
+		IJ.run("Z Project...", "start=[] stop=[] projection=Median");
+		Thread.sleep((20*bgSamples)+200); //give time to make new image
+		IJ.saveAs(imageType[0], rootDir+"BG_"+configPresets[i]+"_Position_"+l+imageType[1]);
+		Thread.sleep(300); //give time for image to save
+		}
+	}
+}
+
+public void preparePositions(){
+	print("There are this many positions: "+pl.getNumberOfPositions());
+	if(pl.getNumberOfPositions()==0){
+		gui.markCurrentPosition();
+		print("The stage will not move.");
+	}
+	if(pl.getNumberOfPositions()==1){
+		print("The stage will stay at the only position in the stage position list.");
+	}
+	if(pl.getNumberOfPositions()>2){
+		print("The stage will move to the positions in the stage position list.");
+	}
+	if(pl.getNumberOfPositions()==2){
+		print("The stage will take images "+intervals+" images along the line formed by the two positions in the stage position list.");
+	double x0=pl.getPosition(0).getX();
+	double y0=pl.getPosition(0).getY();
+	double z0=pl.getPosition(0).getZ();
+	
+	double x1=pl.getPosition(1).getX();
+	double y1=pl.getPosition(1).getY();
+	double z1=pl.getPosition(1).getZ();
+	
+	double deltaX=(x1-x0)/intervals;
+	double deltaY=(y1-y0)/intervals;
+	double deltaZ=(z1-z0)/intervals;
+	pl.clearAllPositions();
+	for (int i=0;i<intervals;i++){
+		MultiStagePosition msp = new MultiStagePosition(xyStage,x0+(i*deltaX) , y0+(deltaY*i), zStage, z0+(deltaZ*i));
+		pl.addPosition(msp);
+	}
+	}
+}
+public double saveResults(String title, String dataFile){
+	IJ.saveAs("Results", title);
+	TextWindow tw = (TextWindow)WindowManager.getFrame("Results"); 
+	 TextPanel tp=tw.getTextPanel();
+	 ResultsTable st = tp.getResultsTable(); 
+	
+	 int n=st.getCounter(); //Assumes that summaries (Mean, SD, Max, Min...) have NOT been added after the last result
+	 double[] meanArr=st.getColumnAsDoubles(st.getColumnIndex("Mean"));
+	 double[] SDArr=st.getColumnAsDoubles(st.getColumnIndex("StdDev"));
+	 double[] medianArr=st.getColumnAsDoubles(st.getColumnIndex("Median"));
+	 double[] maxArr=st.getColumnAsDoubles(st.getColumnIndex("Max"));
+	 double[] areaArr=st.getColumnAsDoubles(st.getColumnIndex("Area"));
+	 double medianMean=StatUtils.percentile(meanArr, 50);
+	 double medianSD=StatUtils.percentile(SDArr, 50);
+	 double medianMedian=StatUtils.percentile(medianArr, 50);
+ 	 double medianMax=StatUtils.percentile(maxArr, 50);
+	 double medianArea=StatUtils.percentile(areaArr, 50);
+	 double meanMax=StatUtils.mean(maxArr);
+	 double meanArea=StatUtils.mean(areaArr);
+	 double meanMean=StatUtils.mean(meanArr);
+	 double ninetyPMean=StatUtils.percentile(meanArr, 90);
+	 double ninetyPMedian=StatUtils.percentile(medianArr, 90);
+	 double ninetyPMax=StatUtils.percentile(maxArr, 90);
+
+		FileWriter writer = new FileWriter(dataFile,true); 
+		writer.write(imageTime+", "+Double.toString(medianMean)+", "+Double.toString(meanMean)+", "+Double.toString(ninetyPMean)+", "+Double.toString(medianSD)+", "
+		+Double.toString(medianMedian)+", "+Double.toString(ninetyPMedian)+", "+Double.toString(meanMax)+", "+Double.toString(medianMax)+", "+Double.toString(ninetyPMax)+", "
+		+Double.toString(meanArea)+", "+Double.toString(medianArea)+", "+Integer.toString(n));
+		writer.close();
+		return meanMax;
+}
+public void sendImmediateMessage(float mediaRatioOn, int samplePumpPWM, int pinchValve, int roomLights){
+	//i indicates the initiation of a message
+	command = "i,"+mediaRatioOn+","+samplePumpPWM+","+pinchValve+","+roomLights; 
+	mmc.setSerialPortCommand(arduinoPort, command, commandTerminator); 
+	Thread.sleep(1000);
+	String answer = mmc.getSerialPortAnswer(arduinoPort, commandTerminator); 
+	if(answer.charAt(0)=='s'){//If the character indicating the start of a message is recieved (filter out junk messages)
+		print(answer.substring(1,answer.length()-1)+"<- milliseconds since timecourse began, measured temperature of bioreactor");
+		FileWriter writer = new FileWriter(rootDir+tempFile+startTime".csv",true); 
+		writer.write("Computer time in milliseconds since the start of the run,"+(System.currentTimeMillis()-startTimeMillis)+",Ardunio timecourse time then temperature in degrees C,"+answer.substring(1,answer.length()-1)+lineSeparator);
+		writer.close();
+	}
+}
+public void loadTimeCourse(){
+
+	//mmc.setSerialPortCommand(port,"i,0,0,0,0",commandTerminator);
+	for (int i=0;i<timeCourse.length;i++){
+		print(timeCourse[i]);
+		mmc.setSerialPortCommand(arduinoPort, "t,"+i+","+Arrays.toString(timeCourse[i]), commandTerminator);
+		Thread.sleep(300);
+	} 
+}
+
+public void acquireImages(){
+		IJ.run("Clear Results", ""); //clear previous results
+		IJ.run("Close All", "");//close all windows
+		gui.snapSingleImage();//This first image is taken because the command is slow the first time that it is run. 
+		//Subsequent calls load the image within 50milliseconds (on the old 32 bit computer it was made for :D )
+		//It causes problems if imageJ commands are called immediatly afterwards
+		Thread.sleep(500);
+		//imageTime is when the image was taken, relative to the start of this script being run, in minutes
+		imageTime=((System.currentTimeMillis()-startTimeMillis)/60000);
+		
+		//*******Take images for each position in the list, in each channel***************//
+		
+		PositionList pl = gui.getPositionList();
+		for (int l=0; l < pl.getNumberOfPositions(); l++) {
+			MultiStagePosition.goToPosition(pl.getPosition(l), mmc);
+			mmc.waitForSystem();
+			Thread.sleep(1000); //Give time for things to settle
+			for (int i=0;i<configPresets.length;i++){//This portion needs to be fast to reduce discrepancy between images
+				mmc.setConfig(configGroup,configPresets[i]);
+				mmc.waitForSystem();
+				gui.snapSingleImage();			
+				Thread.sleep(50); //Give time for things to settle	
+				if(needBgSamples)
+					IJ.saveAs(imageType[0], rootDir+imageNumber+"_"+configPresets[i]+"_Position_"+l+imageType[1]);
+				else
+					IJ.saveAs(imageType[0], rootDir+imageNumber+"_"+configPresets[i]+"_Position_"+l+"_BG_Subtracted"+imageType[1]);
+				}
+				mmc.setConfig(configGroup,darkPreset);// Return to configurationpresets[0]. This is useful if other presets fluorescent light
+			}
+		Thread.sleep(100); //Give time to save images
+		IJ.run("Close All", "");//close all windows
+}
+public double getData(){
+	double intensity=-314;//A preposterous value to signify that it was not updated
+
+		//**************************Process images************************************//
+		
+		//PREPARE IMAGES. Subtract background from each image (or other operation) and translate Images
+			for (int l=0; l < pl.getNumberOfPositions(); l++) {
+				for (int i=0;i<configPresets.length;i++){
+					backgroundArithmetic(rootDir+"BG_"+configPresets[i]+"_Position_"+l+imageType[1],
+												rootDir+imageNumber+"_"+configPresets[i]+"_Position_"+l+imageType[1],
+												rootDir+imageNumber+"_"+configPresets[i]+"_Position_"+l+"_BG_Subtracted"+imageType[1],
+												configPresetsBG[i]);
+				}
+			
+			IJ.run("Close All", "");//close all windows
+			IJ.run("Clear Results", ""); //clear previous results
+			//WARNING: The stack is ordered alphabetically. Insert titles alphabetically ordered. title 1 should preced title2
+			print("Align : "+rootDir+imageNumber+"_"+configPresets[roiPreset]+"_Position_"+l+"_BG_Subtracted"+imageType[1]+" and "+rootDir+imageNumber+"_"+configPresets[analyzePreset]+"_Position_"+l+"_BG_Subtracted"+imageType[1]);
+			alignImages(rootDir+imageNumber+"_"+configPresets[roiPreset]+"_Position_"+l+"_BG_Subtracted"+imageType[1],rootDir+imageNumber+"_"+configPresets[analyzePreset]+"_Position_"+l+"_BG_Subtracted"+imageType[1]);
+			IJ.run("Close All", "");//close all windows
+			}
+			
+					//**************************Analyze images************************************//
+					
+			//ANALYZE IMAGES processAndThreshold fills the ROI manager after creating a binary using code that comes from ImageJ > PlugIns> Macros > Record > Beanshell script
+			IJ.run("Clear Results", ""); //clear previous results
+			for (int l=0; l < pl.getNumberOfPositions(); l++) {
+			ROIsAtPosition=processAndThreshold(rootDir+imageNumber+"_"+configPresets[roiPreset]+"_Position_"+l+"_BG_Subtracted"+imageType[1],
+											rootDir+imageNumber+"_"+configPresets[roiPreset]+"_Position_"+l+"_BG_Subtracted_Binary"+imageType[1]);
+			IJ.run("Close All", "");//close all windows
+			Thread.sleep(100);
+			//If there are regions of interest, analyze the following image using the ROIs from the ROI manager. An overlay will be saved on it (which doesn't hange the image)
+			if(ROIsAtPosition>0)
+				analyzeROIs(rootDir+imageNumber+"_"+configPresets[analyzePreset]+"_Position_"+l+"_BG_Subtracted"+imageType[1]);
+			ROIs=ROIs+ROIsAtPosition;
+			}
+
+		//**************************Save data************************************//
+			
+			if(ROIs>0){
+				intensity=saveResults(rootDir+"Results"+imageNumber+".xls",rootDir+dataFile+startTime+".csv");
+			IJ.run("Distribution...", "parameter=Median or=100 and=0-1000");
+			IJ.saveAs("PNG", rootDir+"Median Distribution"+imageNumber+".png");
+			IJ.run("Distribution...", "parameter=Max or=100 and=0-1000");
+			IJ.saveAs("PNG", rootDir+"Max Distribution"+imageNumber+".png");
+			IJ.run("Distribution...", "parameter=Mean or=100 and=0-1000");
+			IJ.saveAs("PNG", rootDir+"Mean Distribution"+imageNumber+".png");
+			IJ.run("Distribution...", "parameter=Area or=180 and=300-8550");
+			IJ.saveAs("PNG", rootDir+"Area Distribution"+imageNumber+".png");
+			}else{//If processAndThreshold returned no ROIs, there is nothing to do. Update dataFile accordingly
+			FileWriter writer = new FileWriter(rootDir+dataFile+startTime+".csv",true); 
+			writer.write(imageTime+", NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, 0");
+			writer.close();
+		}
+		FileWriter writer = new FileWriter(rootDir+dataFile+startTime+".csv",true); 
+		writer.write(", "+lightOnTime+", "+lightOffTime+", "+pumpOffDelay+", "+mediaOnTime+", "+mediaOffTime+lineSeparator);
+		writer.close();
+		return intensity;
+}
+prepareDataFile(){
+	FileWriter writer = new FileWriter(rootDir+dataFile+startTime+".csv",true); 
+	writer.write("The background was subtracted from images,"+needBgSamples+lineSeparator);
+	writer.write("The median pixel of this many images was used to generate the background,"+bgSamples+lineSeparator);
+	writer.write("Number of milliseconds that the experiment is set to last,"+durationMillis+lineSeparator);
+	writer.write("Experimental images were taken every (this amount of milliseconds),"+imageDelay+lineSeparator);
+	writer.write("Before each non-background image was acquired yeast settled for this many milliseconds,"+pumpOffDelay+lineSeparator);
+	writer.write("Micromanager configuration group,"+configGroup+lineSeparator);
+	writer.write("Preset used to acquire image to segment where the yeast are,"+configPresets[roiPreset]+lineSeparator);
+	writer.write("Preset used to measure fluorescence intensity within previously acquired segmentations,"+configPresets[analyzePreset]+lineSeparator);
+	writer.write("Preset that was used between images,"+darkPreset+lineSeparator);
+	writer.write(lineSeparator+lineSeparator);
+	writer.write("time (min), Median Mean Intensity, Mean Mean Instensity, 90th Percentile of Means, Median SD of Intensity, Median Median Intensity, 90th Percentile of Medians,"
+		+"Mean Max, Median Max, 90th Percentile of Maxes, Mean Area, Median Area, Sample Size, Light On Time, Light Off Time, Pump On Delay, Pump Off Delay, MediaOnTime, MediaOffTime"+lineSeparator);
+	writer.close();
+}
+public void reAnalyzeImages(int first,int last, String dataFile){
+	FileWriter writer = new FileWriter(rootDir+dataFile+startTime+".csv",true); 
+	writer.write("imageTime, medianMean, meanMean, ninetyPMean, medianSD, medianMedian, ninetyPMedian, meanMax, medianMax, ninetyPMax, meanArea, medianArea, n,\n");
+	writer.close();
+	
+	for(int imageNumber=1;imageNumber<=nrImages;imageNumber++){
+		//get data for each image
+	}
+
+		print("Done.");
+		Thread.sleep(10000);
+		System.exit(0);
+}
+
+
+//**************************************************************************************************************************
+//****************INITIALIZING STEPS BELOW********************************************************************************************
+//**************************************************************************************************************************
+
+long startTimeMillis=System.currentTimeMillis(); //Used to mark when the experiment started in Milliseconds
+long lastBG;
+gui.clearMessageWindow();
+gui.closeAllAcquisitions();
+gui.enableLiveMode(liveMode);
+preparePositions();
+mmc.setConfig(configGroup,darkPreset);
+
+
+startTime=sdf.format(new Date());
+if(retroAnalysis){
+	// Set first to the first image that should be reanalyzed and last to the last image that should be reanalyzed.
+	reAnalyzeImages(int first=1,int last=5, String dataFile="retroSummary")
+}
+loadTimeCourse();
+prepareDataFile();
+print("Images and results will be save in the "+rootDir+ "directory.");
+//**************************************************************************************************************************
+//****************MAIN EXPERIMENT BELOW*************************************************************************************
+//**************************************************************************************************************************
+while(System.currentTimeMillis()<(startTimeMillis+durationMillis){
+		imageNumber++;
+		ROIs=0;
+		//amount of time media pump is on for every 30 seconds (0-1), sampling pump power (0-255), pinch valve (0-255), room light(255-> relay switch open and lights are off. 0-> relay switch closed and lights On)
+		sendImmediateMessage(mediaRatioOn,0,0,255);
+		Thread.sleep(settlingTime);
+		//*******Prepare to take the images***************//
+		gui.message("Image number: " + imageNumber);
+		gui.enableLiveMode(false); //Stop the live video
+		curIntensity=-100; //Measured intensity will not be negative. Initialized as negative to facilitate troubleshooting
+		//This is an important method. It acquires the images, processes them, analyzes them, and saves the data
+		acquireImages();
+		sendImmediateMessage(mediaRatioOn,sampleRatioOn,255,255);
+		lastBG=System.currentTimeMillis();
+		generateBG();
+		curIntensity=getData();
+		print("The median intensity of the median pixel in the ROIs is "+curIntensity);
+		if (liveMode) //Show video if liveMode (boolean)
+			gui.enableLiveMode(true);
+}//End of WHILE loop
+
+FileWriter writer = new FileWriter(rootDir+dataFile+startTime+".csv",true); 
+writer.write(lineSeparator+"Experiment ended at "+sdf.format(new Date()));
+writer.close();
+
+gui.enableLiveMode(false); //Stop the live video
+print("Experiment completed. Last image taken at "+sdf.format(new Date()));
+
+
