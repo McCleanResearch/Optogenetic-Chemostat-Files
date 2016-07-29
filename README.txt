@@ -5,7 +5,7 @@ Principal Investigator: Megan McClean, mmcclean@wisc.edu
 Lab website: http://mccleanlab.bme.wisc.edu
 --------------------------------------------------------------------------------------
 SUMMARY: This repository contains files for creating a continuous culturing apparatus
-for the purpose of studing the effects of light exposure on the cultured microbes
+for the purpose of studing the effects of light exposure on cultured microbes
 by microscopy. At a high level: The user will use "Micro-Manager" to control a
 microscope, FIJI to analyze the images, an arduino microcontroller to control
 peristaltic pumps and a heating pad, and a beanshell script to coordinate these
