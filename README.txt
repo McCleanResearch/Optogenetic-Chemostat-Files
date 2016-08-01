@@ -44,22 +44,7 @@ control the LED matrix over time. It is not necessary, but it may be useful to
 use this file instead of manually entering these values into the "bioreactorController"
 plugin.
 
-<<<<<<< HEAD
 -The "supplementary_scripts" folder contains Beanshell (a java-like language) scripts
 that can be used in place of the plugin. The downside of using these scripts is that they
 may not be synchronized with the plugin code. The benefit of using them is that they can
 be easily customized in the beanshell script editor.
-=======
--The ".bsh" files are beanshell scripts. Beanshell is similar to java. The best way
-to learn about it would be to open the "supplementaryScript1_Intro_to_beanshell.bsh"
-in the script editor in Micro-Manager. This file performs some simple arithmatic
-and print calls which demonstrate how the language wroks. The most important
-of these files is the "experimentScript.bsh." This is the file that is actually used
-to run the optogenetic chemostat. Importantly, its first action is to pull values
-from the ".csv" files. This is the results of an (amateur) attempt to generalize the
-code. In reality, the user will benifit from looking at the code itself and modifying
-it for their on purpose.
-
--The "microcontroller_code" folder contains code that should be uploaded to the
-microcontroller and its own "readme"
->>>>>>> origin/master
