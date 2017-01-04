@@ -1,5 +1,0 @@
-Time at which the matrix will be set to these values(seconds),Number of LEDs to turn on,Pulse-width-modulation to those LEDS. 0 is no current. 15 is max current.
-numVals,3,Number of subsequent parameters/variables excluding this value. Thus it will be the line number minus 2.
-0,0,0
-21600,24,8
-43200,10,10

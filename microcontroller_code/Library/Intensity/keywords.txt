@@ -1,5 +1,0 @@
-Intensity	KEYWORD1
-
-PWM	KEYWORD2
-
-numLEDs	KEYWORD2
