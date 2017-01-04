@@ -26,7 +26,12 @@ regulates power to the peristaltic pumps and heating pad of the continuous cultu
 vessel, and it can call external scripts for supplementary analysis or feedback control.
 
 	--To use this to control a bioreactor and microscope, configure micromanager as a Fiji
-	plugin (see the extensive manual for verbose instructions). 
+	plugin (see the extensive manual for verbose instructions). Note that the image analysis 
+	can easily be modified from the default settings by using an image anlysis script. I recommend
+	using the "Image_Analysis_Script.bsh" as a starting point for custom analysis. Open it by 
+	opening Fiji>Macros>Record. Then select "Beanshell" from the Record menu. Then click a button 
+	that is recorded. Then click Create. Then go to File>Open to open this script. The portions
+	that are most useful to edit are: preProcess() at line 49 and makeBinary() at line 67.
 		Youtube demonstration: https://www.youtube.com/watch?v=FP84-2O_o3E
 
 	--To use "Bioreactor_Controller.jar" to retrospectively analyze images, call the plugin from

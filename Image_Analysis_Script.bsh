@@ -1,0 +1,285 @@
+import ij.IJ;
+import ij.ImagePlus;
+import ij.ImageStack;
+import ij.gui.Roi;
+import ij.measure.ResultsTable;
+import ij.plugin.filter.Analyzer;
+import ij.plugin.filter.ParticleAnalyzer;
+import ij.plugin.frame.RoiManager;
+import ij.process.ImageProcessor;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+IJ.log("testing");
+
+public ParticleAnalyzer getParticleAnalyzer(double minArea, double maxArea, double minCircularity, double maxCircularity) {
+	IJ.run("Set Measurements...",
+			"area mean standard modal min centroid center perimeter "
+					+ "bounding fit shape feret's integrated median skewness kurtosis area_fraction "
+					+ "stack redirect=None decimal=3");
+	// These settings don't affect how it is shown once the dialog is used,
+	// but they're written here in case this should later be implemented
+	// without a dialog
+	ParticleAnalyzer pa = new ParticleAnalyzer(ParticleAnalyzer.ADD_TO_MANAGER
+			+ ParticleAnalyzer.INCLUDE_HOLES
+			+ ParticleAnalyzer.SHOW_RESULTS + ParticleAnalyzer.SHOW_NONE,
+			Analyzer.getMeasurements(), ResultsTable.getResultsTable(),
+			minArea, maxArea,  minCircularity,  maxCircularity);
+	return pa;
+}
+IJ.log("testing2");
+	
+public ImageStack processRoiStack(ImageStack roiStack){
+	ImageStack processedStack=new ImageStack(roiStack.getWidth(),roiStack.getHeight());
+	for(int i=1;i<=roiStack.size();i++){
+		ImageProcessor tmpProc=roiStack.getProcessor(i);
+		ImagePlus tmpImg=new ImagePlus("",tmpProc);
+		tmpImg=preProcess(tmpImg);
+		processedStack.addSlice(tmpImg.getProcessor());
+	}
+	return processedStack;
+}
+	IJ.log("testing3");
+public ImagePlus preProcess(ImagePlus imp){
+	IJ.run(imp, "Despeckle", "");
+	IJ.run(imp, "Subtract Background...", "rolling=25");
+	IJ.run(imp, "8-bit", "");
+	return imp;
+}
+
+	
+/*
+ * This method takes an image and converts it to a binary.
+ * It is very likely to be tweaked and re-tweaked as the
+ * acquisition methods (phase contrast vs. DIC, 10x vs. 40x ...) or 
+ * microbe of interest change.
+ * 
+ * It takes an ImagePlus and returns an 8-bit ImagePlus
+ * binary
+ */
+
+public ImagePlus makeBinary(ImageStack imStk) {// CJS
+
+	ImagePlus imp=new ImagePlus("",imStk);
+
+	// This workflow is based on http://fiji.sc/Segmentation
+
+	// This code can be easily replaced by code recorded while manually
+	// manipulating an image Plugins > Macros> Record... > Record BeanShell
+	// This script assumes that rm will be updated (probably by using the
+	// Particle Analyzer)
+	IJ.setAutoThreshold(imp, "Moments dark stack");
+	IJ.run(imp, "Convert to Mask", "method=Moments background=Dark black");
+	IJ.run(imp, "Despeckle", "stack");
+	IJ.run(imp, "Options...", "iterations=1 count=1 black do=Nothing");
+	
+	IJ.run(imp, "Dilate", "stack");
+	IJ.run(imp, "Close-", "stack");
+	IJ.run(imp, "Dilate", "stack");
+	IJ.run(imp, "Close-", "stack");
+	IJ.run(imp, "Fill Holes", "stack");
+	IJ.run(imp, "Options...", "iterations=2 count=1 black do=Nothing");
+	IJ.run(imp, "Erode", "stack");
+	IJ.run(imp, "Despeckle", "stack");
+	IJ.run(imp, "Remove Outliers...", "radius=20 threshold=50 which=Bright stack");
+	return imp;
+}
+
+	
+/*
+ *  This is very likely to be tweaked and re-tweaked.
+ *  
+ *  It takes a binary image and a particle analyzer, 
+ *  and it returns an ROI manager containing ROIs found
+ *  by the particle analyzer
+ *  
+ *  Warning! Calling this method will clear a 
+ *  pre-existing ROI manager of its ROIs
+ */
+
+public RoiManager findCells(ImageProcessor binProc, ParticleAnalyzer pa) {// CJS
+	RoiManager rm = RoiManager.getInstance();
+	if (rm == null)
+		rm = new RoiManager();
+	if (rm.getCount() != 0) {// Ensure that ROI manager is clear (the
+								// RoiManager.reset() function doesn't seem
+								// to work)
+		rm.runCommand("Deselect");
+		rm.runCommand("Delete");
+	}
+
+	// This explicitly sets the RoiManager that the ParticleAnalyzer
+	// implicitly uses
+	ParticleAnalyzer.setRoiManager(rm);
+	
+	
+	pa.analyze(new ImagePlus("",binProc));
+	return rm;
+}
+	
+/*
+ * Measure the properties of the image for each ROI in the RoiManager.
+ * Return a results table of the measurements.
+ * 
+ * Warning! This does not set what the measurement variables should be.
+ * They are set as as FIJI global constants which can be modified like in the 
+ * following example (used in the default settings of this object):	
+ * 
+ * IJ.run("Set Measurements...",
+			"area mean standard modal min centroid center perimeter "
+					+ "bounding fit shape feret's integrated median skewness kurtosis area_fraction "
+					+ "stack redirect=None decimal=3");
+*
+*WARNING! If a null value for the ResultsTable was sent in,
+*then this will take the default one, clear it, and then use it. 
+*Ensure that there is not important information in the 
+*default table
+ */
+
+public List getResults(ImageStack binStack,ImageStack fluorStack
+		,ParticleAnalyzer pa,ResultsTable rt,int set
+		,String pathToCSV) {
+	List rois=new LinkedList();
+	for(int i=1;i<=binStack.size();i++){
+		RoiManager rm=findCells(binStack.getProcessor(i),pa);
+		Roi[] roiArr=rm.getRoisAsArray();
+		for(Roi roi:roiArr){
+			//gets [max caliper distance, angle, min caliper distance, feretX, feretY] 
+			double[] feretVals=roi.getFeretValues();
+			if(feretVals[0]/feretVals[2]<=this.maxEccentricity){
+				roi.setPosition(i);
+				rois.add(roi);
+			}
+		}
+		if(rt==null){
+			rt=ResultsTable.getResultsTable();
+		}
+		rt.reset();
+		rm.runCommand(new ImagePlus("",fluorStack.getProcessor(i)), "Measure");
+		//Ensure that this.rt is pointing to the ResultsTable used by the measure command.
+		//This re-assignment seems redundant, but without it I didn't get a results table with headers.
+		this.rt=ResultsTable.getResultsTable();
+		if(set==0&&i==1)
+			writeHeaders(pathToCSV,rt);
+		saveResults(rt,pathToCSV,set,i-1);
+		
+	}
+	return rois;
+}
+
+public void writeHeaders(String pathToCSV, ResultsTable rt){
+	try {
+		FileWriter writer = new FileWriter(pathToCSV, true);
+		writer.write("row," + Arrays.toString(rt.getHeadings())
+				+ ", Position,Acquisition Set\n");
+		writer.close();
+	} catch (IOException e) {
+		e.printStackTrace();
+	}
+}
+
+//This saves the results to a CSV file in a standardized format
+public void saveResults(ResultsTable rt,String savePath,int set,int pos){
+	for (int row = 0; row < rt.getCounter(); row++) {
+		try{
+			FileWriter writer = new FileWriter(pathToCSV, true);
+			writer.write(rt.getRowAsString(row).replaceAll("\t", ",") + ",");
+			writer.write(Integer.toString(pos)+","+Integer.toString(set)+ "\n");
+			//writer.write(String.format("%05d", pos)+","+
+				//	String.format("%05d", set)+ "\n");
+			writer.close();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+	}
+}
+
+
+public static RoiManager saveRois(List roiList, String filePath){
+	RoiManager rm=RoiManager.getInstance();
+	if (rm == null)
+		rm = new RoiManager();
+	if (rm.getCount() != 0) {// Ensure that ROI manager is clear (the
+								// RoiManager.reset() function doesn't seem
+								// to work)
+		rm.runCommand("Deselect");
+		rm.runCommand("Delete");
+	}
+	rm.runCommand(IJ.getImage(),"Show None");
+	double counter=0;
+	IJ.showStatus("Loading ROIs to manager...");
+	for(Roi roi:roiList){
+		rm.addRoi(roi);
+		counter++;
+		if(counter%50==0)
+			IJ.showProgress(counter/roiList.size());
+	}
+	IJ.showProgress(1);
+	rm.runCommand("Save", filePath);
+	return rm;
+}
+/*
+ * THE SCRIPT FIRST REALLY BEGINS HERE---
+ * The commented variables below are expected to be set in the beanshell interpreter before 
+ * this source file is called.
+ */
+
+//public ImageStack roiStack;
+//public ImageStack fluorStack;
+//public String pathToCSV;
+//public double maxEccentricity;
+//public int set;
+//public String[] pathToSaveProcessedImages;
+//public boolean inputRoiStackIsProcessed;
+//public double[] paParams=new double[4]; //String array with [minArea, maxArea,minCircularity,maxCircularity] for particle analyzer
+
+
+public ImageStack binStack;//binary
+public ParticleAnalyzer pa=getParticleAnalyzer(paParams[0],paParams[1],paParams[2],paParams[3]);
+public ResultsTable rt;
+
+/* 
+ * resultsTable is allowed to be null. It's checked later because
+ * I don't want to assign its default value until immediately
+ * before it is used. This enables me to pick a default value with
+ * the most up-to-date information
+ * 
+ * The binStack is also left null at first.
+ */
+
+
+if(!inputRoiStackIsProcessed){
+	roiStack=processRoiStack(roiStack);
+	if(pathToSaveProcessedImages.length==roiStack.size()){
+		for(int i=0;i<pathToSaveProcessedImages.length;i++){
+			//the first processor is retrieved with getProcessor(1)
+			ImageProcessor tmpProc=roiStack.getProcessor(i+1);
+			ImagePlus tmpImg=new ImagePlus("",tmpProc);
+			IJ.save(tmpImg,pathToSaveProcessedImages[i]);
+		}
+	}
+}
+binStack=makeBinary(roiStack).getImageStack();
+List roiList=getResults(binStack,fluorStack,pa,rt,set,pathToCSV);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
